@@ -1,0 +1,125 @@
+================================================================================
+EXPERIENCE & KNOWLEDGE BASE: 1.9" ST7789 SCREEN USAGE (ESP32-C6 1.9" BOARD)
+================================================================================
+Date: October 2026
+Target Board: Waveshare ESP32-C6FH8 1.9" LCD Dev Board (No-Touch)
+Display Controller: ST7789V2 (IPS TFT)
+Resolution: 170 × 320 pixels
+Bus Protocol: 4-Wire SPI (Hardware SPI, shared with onboard MicroSD slot)
+
+--------------------------------------------------------------------------------
+1. HARDWARE PINOUT & WIRING MAPPING
+--------------------------------------------------------------------------------
+- TFT_MOSI (SDA / DIN): GPIO 4  (Shared with MicroSD MOSI)
+- TFT_SCLK (SCL / CLK): GPIO 5  (Shared with MicroSD SCLK)
+- TFT_DC   (Data/Command): GPIO 6
+- TFT_CS   (Chip Select): GPIO 7
+- TFT_RST  (Hardware Reset): GPIO 14
+- TFT_BL   (Backlight): GPIO 15
+- MISO: Unused / Not connected (ST7789 is write-only; pass -1 in SPI.begin)
+
+--------------------------------------------------------------------------------
+2. BACKLIGHT LOGIC & TROUBLESHOOTING
+--------------------------------------------------------------------------------
+- Pin: GPIO 15
+- Polarity: Controlled via an onboard N-channel MOSFET / transistor.
+  * ON: Active LOW (`digitalWrite(TFT_BL, LOW)`) on standard Waveshare boards.
+  * OFF: `digitalWrite(TFT_BL, HIGH)`.
+- If the screen appears completely pitch-black upon boot, check this pin first.
+  Flip between LOW and HIGH to verify transistor polarity.
+
+--------------------------------------------------------------------------------
+3. ARDUINO LIBRARY SUPPORT & SETUP
+--------------------------------------------------------------------------------
+A. Recommended: Adafruit ST7735 and ST7789 Library (Adafruit_ST7789)
+   - Widely accessible via standard Arduino Library Manager.
+   - Dependencies: `Adafruit GFX Library`, `Adafruit BusIO`.
+   - Setup in Code:
+       #include <SPI.h>
+       #include <Adafruit_GFX.h>
+       #include <Adafruit_ST7789.h>
+
+       Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+       void setup() {
+         pinMode(TFT_BL, OUTPUT);
+         digitalWrite(TFT_BL, LOW);
+
+         // CRITICAL FOR ESP32-C6: Map Hardware SPI before initializing driver
+         SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+
+         // CRITICAL FOR 170x320: Native offset handling
+         tft.init(170, 320);
+         tft.setRotation(0); // 0 = Portrait (170x320), 1 = Landscape (320x170)
+       }
+
+B. Alternative: GFX Library for Arduino (Arduino_GFX_Library by Moon On Our Nation)
+   - Also fully compatible.
+   - Requires explicit offsets:
+       Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI);
+       Arduino_GFX *gfx = new Arduino_ST7789(bus, TFT_RST, 0, true, 170, 320, 35, 0, 35, 0);
+
+--------------------------------------------------------------------------------
+4. THE 170×320 RESOLUTION OFFSET MECHANICS
+--------------------------------------------------------------------------------
+- The underlying ST7789 driver chip has an internal 240 × 320 RAM frame buffer.
+- Because the physical glass panel on this board is only 170 pixels wide:
+  * Difference: 240 - 170 = 70 pixels unused.
+  * The active viewing window is centered with a 35-pixel horizontal offset
+    ((240 - 170) / 2 = 35).
+- If you call generic `tft.init(240, 320)` or `tft.init(240, 240)`, graphics will
+  be shifted horizontally off the screen or clipped by 35 pixels.
+- Passing `tft.init(170, 320)` in modern `Adafruit_ST7789` drivers automatically
+  programs the MADCTL / CASET window offset registers correctly.
+
+--------------------------------------------------------------------------------
+5. SOLVING DISPLAY FLICKER & NUMBER GLITCHING (CRITICAL UI DISCOVERY)
+--------------------------------------------------------------------------------
+* THE PROBLEM:
+  When displaying rapidly updating telemetry numbers (e.g., IMU Roll, Pitch, Accel),
+  calling `tft.fillRect(x, y, w, h, ST77XX_BLACK)` before drawing text created
+  severe screen flicker, strobe effect, and visual tearing.
+
+* WHY IT HAPPENED:
+  Over SPI, drawing a solid black rectangle takes 3 to 5 milliseconds. During that
+  interval, the screen area is completely blank black before the text characters
+  are drawn. Repeating this 25+ times per second created visible blanking frames.
+
+* THE 3-STEP SOLUTION FOR FLICKER-FREE UI:
+
+  1. DUAL-COLOR TEXT RENDERING:
+     - Always use: `tft.setTextColor(FOREGROUND_COLOR, BACKGROUND_COLOR)`
+       Example: `tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK)`
+     - In Adafruit_GFX, passing the background color makes the font engine render
+       both the font pixels AND the black cell background in a single atomic pass!
+     - Completely eliminates the need to call `tft.fillRect()` before drawing text!
+
+  2. FIXED-WIDTH PADDED STRINGS:
+     - Always format numbers with explicit signs, fixed widths, and trailing spaces:
+       `tft.printf("Roll:  %+6.1f deg  ", roll);`
+       `tft.printf("X:%+5.2f  Y:%+5.2f ", ax, ay);`
+     - The trailing spaces ensure that when a number shrinks from -12.5 to 2.1,
+       the previous characters are cleanly overwritten without leaving ghost digits.
+
+  3. DECOUPLED REFRESH RATES:
+     - Graphical elements (e.g., dynamic bubble level or cursor):
+       Update at high frame rate (~30 FPS, every ~33ms).
+       Only erase the previous small cursor circle (`tft.fillCircle(oldX, oldY, r, BLACK)`)
+       and draw the new one (`tft.fillCircle(newX, newY, r, GREEN)`).
+     - Numerical text readouts:
+       Update at low frame rate (~5 FPS, every ~200ms).
+       Human eyes cannot comfortably read numbers changing at 30 FPS anyway.
+       Updating text at 5 FPS yields rock-solid, crystal-clear, flicker-free displays.
+
+--------------------------------------------------------------------------------
+6. SHARED SPI BUS WITH MICROSD CARD CAUTION
+--------------------------------------------------------------------------------
+- SCLK (GPIO 5) and MOSI (GPIO 4) are shared between the ST7789 LCD and the 
+  MicroSD card reader.
+- To prevent SPI bus collisions when using both:
+  * LCD Chip Select: GPIO 7 (TFT_CS)
+  * SD Card Chip Select: GPIO 20 (SD_CS)
+  * Always ensure one CS is driven HIGH (deselected) while communicating with 
+    the other peripheral over SPI.
+================================================================================
+

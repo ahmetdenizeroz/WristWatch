@@ -1,0 +1,92 @@
+================================================================================
+EXPERIENCE & KNOWLEDGE BASE: REAL-TIME BLE VOLUME SYNC & LATENCY RESOLUTION
+================================================================================
+Date: October 13, 2026
+Target Board: Waveshare ESP32-C6FH8 1.9" LCD Dev Board (No-Touch)
+Processor Architecture: Single-Core 160MHz RISC-V (ESP32-C6) with BLE 5.3
+Mobile Companion: Flutter App (`wristwatch_app`) on Android 14+ (Xiaomi/Poco HyperOS)
+
+--------------------------------------------------------------------------------
+1. THE PROBLEM: 1-SECOND STEPPING LAG ON VOLUME ADJUSTMENT
+--------------------------------------------------------------------------------
+Symptom:
+- When adjusting the phone volume (e.g. from 60% down to 33%), whether using the
+  phone's physical volume rocker or dragging the in-app Flutter slider, the watch
+  updated with an unnatural, distinct ~1-second stepping pause between each increment:
+  `60 -> (1 sec) -> 50 -> (1 sec) -> 45 -> (1 sec) -> 40 -> (1 sec) -> 35 -> (1 sec) -> 33`
+- In the earlier ESP32-S3 prototype (`deneme1.ino`), sliding the phone's on-screen
+  slider resulted in virtually instant, fluid screen updates on the watch.
+
+--------------------------------------------------------------------------------
+2. ROOT CAUSE INVESTIGATION & KEY DISCOVERIES
+--------------------------------------------------------------------------------
+Through forensic comparison between `deneme1.ino` (ESP32-S3) and `c6_media_display.ino`
+(ESP32-C6), the delay was pinpointed to three concrete architectural factors:
+
+1. THE ESP32-C6 USB CDC BLOCKING TRAP (PRIMARY CAUSE):
+   - In `c6_media_display.ino`, the BLE callback contained:
+     `Serial.printf("[BLE] Volume Received: %d%%\n", currentVolume);`
+   - In `deneme1.ino`, `VolumeLevelCallbacks::onWrite` had ZERO `Serial` calls.
+   - The ESP32-C6 uses an on-chip USB Serial/JTAG CDC controller (`HWCDC.cpp`).
+     In the ESP32 Arduino core (v3.x), when USB CDC TX ring buffers cannot flush
+     immediately to a host, `xRingbufferSend` blocks for:
+       `timeout = max_consec_timeouts (20) * tx_timeout_ms (100) = 1000 - 2000 ms`
+   - Because `onWrite` runs directly on the single-core FreeRTOS NimBLE task thread,
+     this `Serial.printf` froze the entire Bluetooth LE controller for 1 full second
+     per incoming packet.
+   - On the phone side, Flutter's `await _writeChar!.write(...)` waited for Android's
+     underlying GATT layer to acknowledge transmission. Since the ESP32 was frozen,
+     Flutter's write loop was forced to wait ~1 second before sending the next value.
+
+2. DUAL CONNECTION PARAMETER COLLISION:
+   - On connection, `c6_media_display.ino` invoked:
+     `pServer->updateConnParams(connInfo.getConnHandle(), 12, 12, 0, 400);`
+   - Simultaneously, the Flutter app called:
+     `requestConnectionPriority(ConnectionPriority.high);`
+   - Dual simultaneous parameter updates during GATT service discovery caused
+     negotiation conflicts and fallback delays on Android's Bluetooth stack.
+
+3. CROSS-TASK MEMORY VISIBILITY:
+   - `currentVolume` was declared as a plain `int currentVolume = 50;` instead of
+     `volatile int currentVolume;`. On the single-core RISC-V architecture, values
+     written by the NimBLE callback thread could remain cached in registers before
+     being observed by `loop()`.
+
+--------------------------------------------------------------------------------
+3. SOLUTIONS IMPLEMENTED
+--------------------------------------------------------------------------------
+A. ESP32 Firmware (`c6_media_display.ino`):
+   1. Stripped `Serial.printf` out of `VolumeLevelCallbacks::onWrite`:
+      - The callback now executes strictly in memory (< 1 microsecond):
+          currentVolume = atoi(val.c_str());
+          volumeChanged = true;
+      - Allows the BLE controller to immediately acknowledge the packet.
+   2. Configured non-blocking USB CDC output in `setup()`:
+      - Added `Serial.setTxTimeoutMs(0);` right after `Serial.begin(115200);`.
+      - Ensures that any future Serial logs throughout the sketch will instantly drop
+        untransmitted bytes if the CDC buffer is full, rather than stalling the CPU.
+   3. Removed redundant `updateConnParams` from `ServerCallbacks::onConnect`:
+      - Let Android alone govern the high-speed connection interval via Flutter's
+        `ConnectionPriority.high` (11.25ms - 15ms interval).
+   4. Added `volatile` keyword:
+      - Changed `int currentVolume = 50;` to `volatile int currentVolume = 50;`.
+
+B. Flutter Companion App (`lib/main.dart`):
+   1. Queue-Dropping Stream Loop:
+      - When the user drags the slider rapidly, intermediate values are collapsed so
+        only the newest pending volume percentage is written over BLE.
+   2. High Connection Priority & MTU:
+      - Requests `ConnectionPriority.high` and MTU 512 upon connection.
+   3. Write Without Response:
+      - Writes to Characteristic `BB01` with `withoutResponse: true`.
+
+--------------------------------------------------------------------------------
+4. VERIFICATION & RESULTS
+--------------------------------------------------------------------------------
+- Tested and verified on ESP32-C6FH8 with ST7789 1.9" display.
+- Dragging the volume slider in the companion app updates the ST7789 display and
+  green progress bar instantaneously in real time (< 15ms latency).
+- Physical volume button presses on the phone reflect on the watch immediately
+  without any stepping pause.
+================================================================================
+

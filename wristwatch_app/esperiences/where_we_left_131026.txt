@@ -1,0 +1,78 @@
+================================================================================
+SESSION STATUS & WHERE WE LEFT OFF
+================================================================================
+Date: October 13, 2026 (00:15)
+Target Hardware: ESP32-C6FH8 with 1.9" ST7789 LCD (320x170 Landscape) + QMI8658 IMU
+Mobile Companion: Flutter App (`wristwatch_app`) on Android 14+ (Poco X7 Pro / HyperOS)
+
+--------------------------------------------------------------------------------
+1. CURRENT WORKING FEATURES (VERIFIED & WORKING)
+--------------------------------------------------------------------------------
+1. Display & UI:
+   - 1.9" ST7789 is running in horizontal / landscape configuration (320x170).
+   - Clean UI layout with top header bar, left 120x120 album art frame, right panel
+     displaying "NOW PLAYING", Song Title, Artist, and dynamic Volume bar.
+   - High-speed 40MHz SPI initialized.
+
+2. VLC & Media Notification Integration:
+   - VLC playback recognition is working directly.
+   - Song Title & Artist metadata are captured from Android media notifications and
+     sent to the watch via Characteristic BB03.
+   - Android 14 / HyperOS service binding and permissions are configured in
+     `android/app/src/main/AndroidManifest.xml` with:
+     `notification.listener.service.NotificationListener`.
+   - Companion app has diagnostics buttons: "Sync Playing VLC", "Reconnect Listener",
+     and "Settings".
+
+3. 120x120 Album Cover Art Protocol:
+   - Resizing and color conversion (RGBA -> RGB565) via `dart:ui`.
+   - Stream protocol: Header `[0xAA, 0x55, 120, 120]`, 240-byte chunks, End `[0xAA, 0xFF]`.
+   - Tested and verified.
+
+--------------------------------------------------------------------------------
+2. VOLUME LATENCY ISSUE (RESOLVED & VERIFIED)
+--------------------------------------------------------------------------------
+Status: SOLVED (October 13, 2026 - 22:55)
+Resolution Details: See `esperiences/volume_sync.txt` for the full technical post-mortem.
+
+Root Cause:
+- ESP32-C6 USB CDC Serial blocking timeout (`HWCDC.cpp`). Calling `Serial.printf`
+  inside `VolumeLevelCallbacks::onWrite` blocked the single-core FreeRTOS NimBLE
+  task for 1000ms per packet whenever the USB CDC buffer could not flush immediately.
+- Flutter's write loop stalled on Android's GATT buffer waiting for ACK from the frozen ESP32.
+
+Fix Applied:
+1. `c6_media_display.ino`:
+   - Removed `Serial.printf` from `VolumeLevelCallbacks::onWrite` (< 1 µs execution).
+   - Added `Serial.setTxTimeoutMs(0)` in `setup()` for non-blocking USB CDC output.
+   - Removed conflicting `pServer->updateConnParams` from `ServerCallbacks::onConnect`.
+   - Declared `volatile int currentVolume = 50;`.
+2. Result:
+   - Volume sync is now instantaneous (< 15ms) when dragging the in-app slider
+     or clicking the phone's physical volume buttons.
+
+--------------------------------------------------------------------------------
+3. FILES & RELEVANT LOCATIONS
+--------------------------------------------------------------------------------
+- ESP32 Firmware:
+  `e:\WristWatch\wristwatch_app\c6_media_display\c6_media_display.ino`
+  * Lines 100-110: `VolumeLevelCallbacks::onWrite` (Instant non-blocking update)
+  * Lines 280-325: `updateVolumeUI()` and `updateMetadataUI()` (Partial redraw)
+  * Lines 334-338: `Serial.setTxTimeoutMs(0)` setup
+  * Lines 375-385: Characteristic `BB01` setup
+  * Lines 415-430: `loop()` volume check
+
+- Flutter Companion App:
+  `e:\WristWatch\wristwatch_app\lib\main.dart`
+  * Lines 280-290: `_volumeController.addListener`
+  * Lines 465-495: `_syncVolumeToWatch` (queue-dropping while loop)
+  * Lines 865-877: UI Volume Slider
+
+- Documentation:
+  * `esperiences/volume_sync.txt` (Complete latency post-mortem)
+  * `esperiences/BLE_cover_art.txt` (Cover art streaming protocol)
+  * `esperiences/screen.txt` (ST7789 170x320 landscape & offset mechanics)
+  * `esperiences/IMU.txt` (QMI8658 registers & calibration)
+================================================================================
+
+

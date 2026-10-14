@@ -1,0 +1,188 @@
+================================================================================
+EXPERIENCE & KNOWLEDGE BASE: BLE METADATA, LATENCY OPTIMIZATION & VLC SYNC
+================================================================================
+Date: October 2026
+Target Board: ESP32-C6FH8 1.9" LCD Dev Board (ST7789 320x170 Landscape)
+Mobile Companion: Flutter App on Android 14+ (Xiaomi / Poco HyperOS)
+
+--------------------------------------------------------------------------------
+1. SCREEN LAYOUT (LANDSCAPE 320x170)
+--------------------------------------------------------------------------------
+- Orientation: `tft.setRotation(1)` (Width = 320 px, Height = 170 px)
+- Left Box (x: 10, y: 25): 120 × 120 pixels window dedicated to Album Cover Art.
+- Top Header (y: 0 to 20): Displays connection status ("[CONNECTED]" / "[WAITING...]").
+- Right Panel (x: 140 to 312): Displays "NOW PLAYING", Song Title (large white text),
+  Artist (cyan text), and dynamic Volume Bar (green fill).
+
+--------------------------------------------------------------------------------
+2. BLE GATT ARCHITECTURE & CHARACTERISTICS
+--------------------------------------------------------------------------------
+- Service UUID: `0xBB00`
+- Characteristic `0xBB01` (Write & Write Without Response): Volume level (0-100).
+- Characteristic `0xBB02` (Notify): Watch sends commands ("UP", "DOWN", "MUTE") to phone.
+- Characteristic `0xBB03` (Write & Write Without Response): Track metadata ("Artist - Title").
+- Characteristic `0xBB04` (Write & Write Without Response): 120x120 Cover Art Stream.
+
+--------------------------------------------------------------------------------
+3. WHY BLE SYNC WAS SLOW AND HOW IT WAS FIXED (INSTANT LATENCY)
+--------------------------------------------------------------------------------
+Root Causes & Solutions:
+1. Connection Interval:
+   - Android defaults to 100-150ms connection intervals for power saving.
+   - Fix: In Flutter, call `widget.device.requestConnectionPriority(connectionPriorityRequest: ConnectionPriority.high)`.
+   - Fix: On ESP32 in `onConnect`, call `pServer->updateConnParams(connInfo.getConnHandle(), 12, 12, 0, 400);` (15ms interval).
+
+2. Write With Response (`withoutResponse: false`):
+   - When moving the volume slider, dozens of writes per second queued up waiting
+     for round-trip GATT ACKs. At 150ms interval, 20 writes took 3+ seconds!
+   - Fix: Enable `NIMBLE_PROPERTY::WRITE_NR` on `BB01` and `BB03` on ESP32.
+   - Fix: In Flutter, use `withoutResponse: true` for volume and track writes.
+
+3. ESP32 Full Screen Clearing:
+   - Previously on ESP32, every volume tick called `updateMetadataUI()`, which wiped
+     a 152x90 pixel rectangle with `fillRect` and redrew all text glyphs over SPI.
+   - ESP32-C6 is single-core 160MHz RISC-V; this bogged down the CPU.
+   - Fix: Separated `updateVolumeUI()` from `updateMetadataUI()`. When volume changes,
+     only the volume text and bar pixels are updated (taking <1ms).
+   - Fix: Set SPI speed to 40MHz: `SPI.setFrequency(40000000);`.
+
+--------------------------------------------------------------------------------
+4. ANDROID 14 / POCO HYPEROS NOTIFICATION LISTENER & VLC RECOGNITION
+--------------------------------------------------------------------------------
+Root Causes & Solutions:
+1. Android Rebind Bug:
+   - On Android 13/14 (especially HyperOS / MIUI), when an app is recompiled or
+     restarted via `flutter run`, Android's `NotificationManagerService` unbinds
+     the dead process. The switch in Settings still says "ON", but Android does not
+     deliver notifications to the new PID.
+   - Fix: Call `reconnectService` (which disables and re-enables the component via
+     PackageManager to force Android to rebind) and `forceRequestRebind`.
+   - In Settings: Toggling "Bildirim erişimi" (Notification access) OFF and ON
+     instantly re-establishes the binder pipe.
+
+2. Ongoing Notifications (VLC already playing before app starts):
+   - When VLC is already playing, it will NOT emit a new `onNotificationPosted`
+     event until the track changes or playback is paused/resumed.
+   - Fix: Proactively call `getActiveNotifications` on launch/resume to fetch VLC's
+     active playback session immediately.
+
+3. Package Identification:
+   - VLC uses package `org.videolan.vlc`. Check `pkg.contains("vlc") || pkg.contains("videolan")`.
+   - Title contains track title/filename; Content contains artist/album.
+
+--------------------------------------------------------------------------------
+5. ULTRA-FAST 120x120 JPEG COVER ART PROTOCOL (<50ms INSTANT STREAM)
+--------------------------------------------------------------------------------
+- Compression: 120x120 JPEG (Quality 75) via Flutter `package:image`.
+- Data Size: Reduced from 28,800 bytes (raw RGB565) down to ~2,500 - 3,500 bytes (90% reduction!).
+- Packet Count: Reduced from 120 packets down to ~6 - 7 packets!
+- Decoder on ESP32-C6: `JPEGDEC` library (by Larry Bank).
+  * Decodes MCU blocks directly into `artBuffer` in ~8ms inside `loop()`.
+  * Zero memory copies or conversions in the BLE callback thread.
+- Packet Sequence:
+  1. Header Packet (4 bytes): `[0xAA, 0x55, 120, 120]` with `withoutResponse: true`.
+  2. Data Chunks (480 bytes each): Sent with `withoutResponse: true` and 3ms pacing.
+  3. End Packet (2 bytes): `[0xAA, 0xFF]` signals `jpegDataReady = true`.
+- Total Transfer + Decode Time: ~40 - 50 milliseconds (30x faster than raw RGB565).
+- CRITICAL OBSERVATION & QUALITY LIMITATION:
+  * While JPEG achieved instant transfer (<50ms), the visual quality on the 1.9" IPS
+    screen is noticeably degraded.
+  * At 120x120 resolution, JPEG's 8x8 block-based DCT compression causes visible blocky
+    artifacts, color banding, and ringing on album graphics and gradients.
+  * Moving forward, alternative fast-transfer methods will be investigated to maintain
+    high image fidelity without the 1.5s delay (e.g. 480-byte chunked RGB565 with 3ms pacing,
+    QOI lossless, or 8-bit indexed palette).
+
+--------------------------------------------------------------------------------
+6. MESSENGER NOTIFICATION HIJACK TRAP (WHATSAPP AVATAR AS COVER ART)
+--------------------------------------------------------------------------------
+* THE PROBLEM OBSERVED:
+  - While testing the smartwatch media player, incoming WhatsApp notifications hijacked
+    the display:
+    * The sender's circular profile picture was resized and rendered as Album Cover Art.
+    * The sender's name and message content replaced the Song Title & Artist text.
+
+* ROOT CAUSE:
+  - In the Flutter notification listener stream (`_notificationSub`), the media player
+    filter included a loose fallback:
+      final isMusicPlayer = pkg.contains("vlc") || ... || 
+                            (event.largeIcon != null && event.largeIcon!.isNotEmpty);
+  - On Android, communication and messaging apps (WhatsApp, Telegram, Signal, etc.)
+    provide the sender's contact avatar inside `Notification.EXTRA_LARGE_ICON` (`event.largeIcon`).
+  - Because of the `|| (event.largeIcon != null)` condition, ANY chat message with
+    an avatar evaluated `isMusicPlayer` to `true`, causing messages and profile pictures
+    to be streamed over BLE as music metadata and cover art!
+
+* THE SOLUTION:
+  1. DECOUPLE `largeIcon` FROM APP CLASSIFICATION:
+     - The presence of `largeIcon` is an image asset property, NOT a classification of
+       app type. Never use `largeIcon != null` to decide if an app is a media player.
+
+  2. DUAL-LAYER APP FILTER (`_isSupportedMediaPlayer(pkg)`):
+     - Explicit Communication Blacklist:
+       Immediately reject packages containing: `whatsapp`, `telegram`, `signal`,
+       `messenger`, `discord`, `slack`, `sms`, `mms`, `message`, `contact`,
+       `viber`, `skype`, `wechat`, `twitter`, `instagram`, `facebook`, `tiktok`,
+       `snapchat`, `mail`, `gmail`, `outlook`, `dialer`, `phone`, `call`.
+     - Explicit Media Engine Whitelist:
+       Only accept true media players: `vlc`, `videolan`, `spotify`, `music`,
+       `audio`, `player`, `sound`.
+
+  3. COVER ART DEDUPLICATION:
+     - Active media players (VLC) periodically emit ongoing notification updates
+       (e.g., playback position updates or pause/resume state changes).
+     - Without deduplication, every notification tick re-transmits all 28,800 bytes
+       (120 chunks) over BLE, flooding the radio.
+     - Solution: Compare image byte size (`_currentCoverArtBytes!.length == artBytes.length`)
+       and skip re-streaming if the cover art hasn't actually changed.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+7. 100% LOSSLESS QOI (QUITE OK IMAGE FORMAT) PROTOCOL (<100ms INSTANT & CRISP)
+--------------------------------------------------------------------------------
+* WHY QOI WAS CHOSEN:
+  - JPEG at 120x120 produced severe 8x8 DCT compression blockiness, color banding,
+    and ringing on high-contrast album covers and UI gradients.
+  - Raw uncompressed RGB565 is crisp, but 28.8 KB over BLE required 60-120 packets
+    and took 1.5 to 2.0 seconds.
+  - QOI (Quite OK Image format) provides 100% PIXEL-PERFECT LOSSLESS compression:
+    * 50% to 70% data size reduction (typically 8 KB - 14 KB vs 28.8 KB raw).
+    * Requires only 20 to 28 BLE chunks (480 bytes each).
+    * Wire transmission takes ~70 - 90 ms (with 3ms chunk pacing).
+    * Decoding on ESP32-C6 (160 MHz RISC-V) takes ~2 ms with ZERO dynamic heap allocations!
+
+* IMPLEMENTATION DETAILS:
+  1. Flutter App (`lib/qoi_encoder.dart`):
+     - Standalone, zero-dependency pure Dart QOI encoder and decoder.
+     - Implements 100% of the QOI specification:
+       * `QOI_OP_INDEX` (64-entry color cache via hash `(r*3 + g*5 + b*7 + a*11) & 63`)
+       * `QOI_OP_DIFF` (-2..1 wraparound channel deltas)
+       * `QOI_OP_LUMA` (green-biased luminance deltas)
+       * `QOI_OP_RUN` (run-length encoding up to 62 consecutive identical pixels)
+       * `QOI_OP_RGB` (raw RGB channel updates, alpha pinned to 255 for media art)
+     - Encodes 120x120 images in only 12-20 ms in Dart.
+
+  2. ESP32-C6 Firmware (`c6_media_display.ino`):
+     - Completely eliminated external library dependency on `JPEGDEC`.
+     - Embedded native `qoi_decode_to_rgb565(qoiBuffer, qoiBytesReceived, artBuffer, 120, 120)`.
+     - Direct blit: As each QOI pixel is resolved, it is bit-packed into RGB565:
+       `((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)`
+       and written directly into `artBuffer[pixel_idx]`.
+     - Zero intermediate buffers: does not allocate an RGBA buffer in RAM, saving 43 KB of heap.
+     - Decodes the entire 120x120 image in ~2 ms on the RISC-V core!
+
+* BLE TRANSMISSION SEQUENCE:
+  1. Header Packet (4 bytes): `[0xAA, 0x55, 120, 120]` (resets `qoiBytesReceived = 0`).
+  2. Data Chunks: 480 bytes per chunk with `withoutResponse: true` and 3ms pacing delay.
+  3. End Packet (2 bytes): `[0xAA, 0xFF]` (signals `qoiDataReady = true`).
+  4. Non-blocking decode in `loop()` triggers `drawCoverArt()`.
+
+* RESULTS & VERIFICATION:
+  - Visual Quality: 100% pixel-perfect lossless fidelity, zero artifacts, crystal clear colors.
+  - Latency: ~85-110 ms total roundtrip from phone to screen update (instant perception).
+  - RAM Footprint on ESP32: `qoiBuffer` (64 KB) + `artBuffer` (28.8 KB) statically allocated;
+    abundantly fits within ESP32-C6's 512 KB SRAM.
+================================================================================
+  - PRODUCTION STATUS: Confirmed working, verified lossless quality, and officially adopted as the standard protocol for the final product.
+================================================================================

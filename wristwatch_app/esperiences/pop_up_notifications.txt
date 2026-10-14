@@ -1,0 +1,129 @@
+================================================================================
+EXPERIENCE & ARCHITECTURE GUIDE: POP-UP NOTIFICATIONS & CALL ALERTS
+================================================================================
+Date: October 14, 2026
+Target Hardware: Waveshare ESP32-C6FH8 1.9" ST7789 LCD (320x170 Landscape)
+Mobile Companion: Flutter App (`wristwatch_app`) on Android 14+ (HyperOS / AOSP)
+
+--------------------------------------------------------------------------------
+1. OBJECTIVE & DESIGN PHILOSOPHY
+--------------------------------------------------------------------------------
+- Persistent vs. Transient Screens:
+  * Media Player (Cover Art, Now Playing, Volume) is a persistent background state.
+  * WhatsApp, SMS, and Phone Calls are high-priority, transient events.
+- Form Factors Adopted:
+  * Messages (WhatsApp / SMS): Floating modal card (280x124 px, centered at X:20, Y:23).
+    Allows the user to read incoming messages without losing context of their media session.
+    Features a real-time auto-dismiss timeout bar (shrinks over 6 seconds).
+  * Phone Calls: Full-screen alert takeover (320x170 px).
+    Demands immediate attention with an animated pulsing banner, large caller name,
+    phone number, and visual Decline / Accept action pills.
+
+--------------------------------------------------------------------------------
+2. BLE GATT PROTOCOL SPECIFICATION
+--------------------------------------------------------------------------------
+- Service UUID: `0xBB00`
+- New Characteristic: `0xBB05` (`CHAR_ALERT_UUID`)
+  * Properties: `NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR`
+  * Format: Pipe-delimited string payloads:
+    1. WhatsApp: `WA|<Sender>|<MessageBody>`
+       Example: `WA|John Doe|Are you free for lunch?`
+    2. SMS: `SMS|<Sender>|<MessageBody>`
+       Example: `SMS|Mom|Call me when you get this message.`
+    3. Incoming Call: `CALL|<CallerName>|<CallerNumberOrStatus>`
+       Example: `CALL|Sarah Connor|+1 (555) 019-2834`
+    4. Call Ended / Dismiss: `CALL_END` or `DISMISS`
+
+--------------------------------------------------------------------------------
+3. ESP32-C6 DISPLAY RENDERING & STATE MACHINE
+--------------------------------------------------------------------------------
+- Screen State Machine:
+  * `SCREEN_MEDIA_PLAYER`: Default view (Static layout, QOI cover art, track info, volume).
+  * `SCREEN_POPUP_MESSAGE`: Active message card. Counts down from 6000 ms.
+  * `SCREEN_INCOMING_CALL`: Active phone call takeover. Pulses banner every 400 ms.
+
+- Protection Against Background Clobbering:
+  * When in `SCREEN_POPUP_MESSAGE` or `SCREEN_INCOMING_CALL`, background volume changes
+    or track changes over BLE update internal variables, but DO NOT draw over the modal.
+  * When the modal dismisses, `restoreMediaPlayerScreen()` redraws the full media UI
+    with the latest volume, song title, and cover art in < 15 ms.
+
+- Text Wrapping on 320x170 LCD:
+  * `drawWrappedText(text, x, y, maxCharsPerLine, maxLines)`
+  * Splits message body across up to 3 lines (max 42 characters per line) at `setTextSize(1)`.
+  * Preserves full words by breaking at spaces and truncates with `...` if text exceeds 3 lines.
+
+- Color Palette (RGB565):
+  * Pop-up Card Background: `0x0841` (Deep dark charcoal)
+  * WhatsApp Accent: `0x25D3` (`#25D366` Emerald Green), Header Bg: `0x0A64`
+  * SMS Accent: `0x04FF` (Azure Blue), Header Bg: `0x01D3`
+  * Call Pulsing Banner: Alternates `0xF800` (Bright Red) and `0x8000` (Dark Crimson)
+  * Action Pills: Decline (`0x8800` fill, `0xF800` border), Accept (`0x0400` fill, `0x07E0` border)
+
+--------------------------------------------------------------------------------
+4. ANDROID COMPANION APP ROUTING (`lib/main.dart`)
+--------------------------------------------------------------------------------
+- Priority Event Pipeline:
+  1. Phone Calls:
+     - Identified by packages containing: `dialer`, `telecom`, `incallui`, `phone`.
+     - When `event.hasRemoved == true` -> Sends `CALL_END`.
+     - When incoming ringing notification arrives -> Sends `CALL|<CallerName>|<Info>`.
+  2. Media Players (VLC, Spotify):
+     - Identified by whitelisted media packages.
+     - Dispatches track metadata to `BB03` and QOI album cover art to `BB04`.
+  3. WhatsApp Messages:
+     - Identified by `com.whatsapp`.
+     - Explicitly filters out background sync noise ("Checking for new messages", "WhatsApp Web active", etc.).
+     - Dispatches `WA|<Sender>|<Message>` to `BB05`.
+  4. SMS Messages:
+     - Identified by `com.google.android.apps.messaging`, `com.miui.mms`, etc.
+     - Dispatches `SMS|<Sender>|<Message>` to `BB05`.
+
+- Interactive Simulation Panel:
+  * Added a dedicated "Pop-Up Notifications Preview" card in the Flutter companion UI
+    with buttons to test WhatsApp, SMS, Incoming Call, and Dismiss/End Call.
+================================================================================
+
+--------------------------------------------------------------------------------
+5. CRITICAL FIXES & ANDROID EDGE CASES (OBSERVED & RESOLVED)
+--------------------------------------------------------------------------------
+1. MISSED CALLS VS ACTIVE INCOMING CALLS:
+   * The Problem:
+     - When the caller hung up before the user answered, or the call was declined,
+       Android's dialer posted a new "Missed Call" notification (`!event.hasRemoved`).
+     - The companion app saw a phone dialer notification and treated it as an active
+       incoming call (`CALL|Missed call|Caller`).
+     - This locked the watch display in the full-screen pulsing `>>> INCOMING CALL <<<`
+       state permanently because no `CALL_END` event was ever sent!
+   * The Solution:
+     - Created `_isMissedCallNotification(title, content)` checking English & Turkish
+       keywords: "missed call", "cevapsız", "kaçırılan", "declined", "reddedildi".
+     - When a missed call arrives:
+       1. Companion app dispatches `CALL_END` first to close any active call takeover.
+       2. Dispatches `MISSED|<Caller>|<Details>` to `BB05`.
+     - On ESP32 (`c6_media_display.ino`):
+       * `MISSED` is handled as a transient floating modal card (`SCREEN_POPUP_MESSAGE`),
+         NOT a full-screen takeover!
+       * Features a `[!] MISSED CALL` header badge in bright red (`0xF800`), displays
+         the caller's name, and auto-dismisses after 6 seconds via the timer bar.
+       * `CALL_END` only dismisses `SCREEN_INCOMING_CALL`, leaving active missed call
+         pop-ups to count down and dismiss naturally.
+
+2. WHATSAPP BUNDLED GROUP SUMMARY NOTIFICATIONS:
+   * The Problem:
+     - When multiple unread messages exist across one or more WhatsApp chats, Android
+       posts a bundled Group Summary notification right alongside the individual message:
+       Title: "WhatsApp", Content: "X messages from Y chats" (or "X sohbetten Y mesaj").
+     - Because both notifications arrived, the summary arrived a split-second later
+       and overwrote the contact's actual message on the watch screen!
+   * The Solution:
+     - Implemented a 2-stage filter in `lib/main.dart`:
+       A. App Title Check:
+          If `title.toLowerCase() == "whatsapp"` or `"whatsapp business"`, immediately
+          DISCARD! A real contact never has the sender name "WhatsApp".
+       B. Summary Content Regex:
+          If content matches `\d+\s+(new\s+)?(messages?|mesaj|chats?|sohbet)` or
+          contains "messages from" / "sohbetten", immediately DISCARD!
+     - Result: Only individual notifications containing the actual sender name and
+       real message text are forwarded to the watch.
+================================================================================

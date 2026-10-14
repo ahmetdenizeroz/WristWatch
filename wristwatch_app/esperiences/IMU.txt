@@ -1,0 +1,150 @@
+================================================================================
+EXPERIENCE & KNOWLEDGE BASE: QMI8658 6-AXIS IMU SETUP (ESP32-C6 1.9" BOARD)
+================================================================================
+Date: October 2026
+Target Board: Waveshare ESP32-C6FH8 1.9" LCD Dev Board (No-Touch)
+IMU Sensor: QMI8658 / QMI8658C (3-Axis Accelerometer + 3-Axis Gyroscope + Temp)
+Bus Protocol: I2C (Standard Wire library, no external IMU libraries required)
+
+--------------------------------------------------------------------------------
+1. HARDWARE PINOUT & BUS SPECIFICATIONS
+--------------------------------------------------------------------------------
+- I2C SDA: GPIO 18
+- I2C SCL: GPIO 8
+- I2C Slave Address: 0x6B (7-bit address; SA0 is pulled HIGH on this board)
+  * Note: 0x6A is the alternative address if SA0 is LOW.
+- Bus Speed: Start at 100 kHz (100000) during device init for reliable ACK,
+  then upgrade to 400 kHz (400000) fast mode after configuration.
+- Power Supply: 3.3V internal rail.
+
+--------------------------------------------------------------------------------
+2. QMI8658 REGISTER MAP & SETUP SEQUENCE
+--------------------------------------------------------------------------------
+- 0x00 (WHO_AM_I):
+  * Must read: 0x05.
+  * Always read this register first during setup() to confirm physical presence.
+
+- 0x60 (RESET):
+  * Soft reset: write 0xB0.
+  * Wait 20-30ms after reset before writing other registers.
+
+- 0x08 (CTRL7 - Power Gating):
+  * CRITICAL RULE (from datasheet): Sensors MUST be placed in Standby (write 0x00)
+    BEFORE writing to configuration registers (CTRL1, CTRL2, CTRL3).
+  * After configuring, write 0x03 to enable both Accelerometer (bit 0 = 1) 
+    and Gyroscope (bit 1 = 1).
+  * Wait 20-30ms after enabling for sensor clocks to stabilize.
+
+- 0x02 (CTRL1 - Serial Interface & Auto-Increment):
+  * Write: 0x60 (or 0x40).
+  * Bit 6 = 1 (ADDR_AI): Enables Address Auto-Increment during multi-byte I2C
+    burst reads. Without this, burst reads will repeatedly return the same byte.
+
+- 0x03 (CTRL2 - Accelerometer Configuration):
+  * Write: 0x13
+  * Bits [6:4] = 0x10 -> Full Scale Range = ±4g (Sensitivity: 8192 LSB/g).
+  * Bits [3:0] = 0x03 -> Output Data Rate (ODR) = 250 Hz.
+
+- 0x04 (CTRL3 - Gyroscope Configuration):
+  * Write: 0x43
+  * Bits [6:4] = 0x40 -> Full Scale Range = ±512 dps (Sensitivity: 64 LSB/dps).
+  * Bits [3:0] = 0x03 -> Output Data Rate (ODR) = 250 Hz.
+
+--------------------------------------------------------------------------------
+3. THE CRITICAL TRAP: REGISTER 0x30 VS 0x33
+--------------------------------------------------------------------------------
+* THE PROBLEM:
+  - When burst-reading data starting at 0x30, the temperature reading showed 
+    approximately -120 °C and steadily climbed, while all accelerometer and 
+    gyroscope numbers fluctuated rapidly and randomly.
+
+* THE ROOT CAUSE:
+  - Registers 0x30, 0x31, 0x32 are the internal 24-bit SAMPLE TIMESTAMP COUNTER
+    (TIMESTAMP_L, TIMESTAMP_M, TIMESTAMP_H), which increments on every sample!
+  - The true Temperature registers start at 0x33 (TEMP_L) and 0x34 (TEMP_H).
+  - The Accelerometer registers start at 0x35 (AX_L).
+  - When reading from 0x30:
+      buf[0..1] was TIMESTAMP -> parsed as temperature (rapid climbing counter!).
+      buf[2..13] was shifted by exactly 3 bytes -> spliced timestamp bits into 
+      acceleration channels, corrupting every single axis.
+
+* THE FIX:
+  - Burst read MUST start at 0x33, requesting exactly 14 bytes:
+      Byte 0: 0x33 (TEMP_L)
+      Byte 1: 0x34 (TEMP_H)
+      Byte 2: 0x35 (AX_L)
+      Byte 3: 0x36 (AX_H)
+      Byte 4: 0x37 (AY_L)
+      Byte 5: 0x38 (AY_H)
+      Byte 6: 0x39 (AZ_L)
+      Byte 7: 0x3A (AZ_H)
+      Byte 8: 0x3B (GX_L)
+      Byte 9: 0x3C (GX_H)
+      Byte 10: 0x3D (GY_L)
+      Byte 11: 0x3E (GY_H)
+      Byte 12: 0x3F (GZ_L)
+      Byte 13: 0x40 (GZ_H)
+
+--------------------------------------------------------------------------------
+4. SENSOR DATA CALCULATIONS
+--------------------------------------------------------------------------------
+1. Temperature (°C):
+   int16_t rawTemp = (int16_t)((buf[1] << 8) | buf[0]);
+   float temperature = (float)rawTemp / 256.0f;
+   * Resolution: 1/256 °C per LSB. Expect room temp: ~24 - 28 °C.
+
+2. Accelerometer (G):
+   int16_t rawAx = (int16_t)((buf[3] << 8) | buf[2]);
+   int16_t rawAy = (int16_t)((buf[5] << 8) | buf[4]);
+   int16_t rawAz = (int16_t)((buf[7] << 8) | buf[6]);
+   float ax = (float)rawAx / 8192.0f; // Scale: ±4g
+   float ay = (float)rawAy / 8192.0f;
+   float az = (float)rawAz / 8192.0f;
+
+3. Gyroscope (degrees/sec):
+   int16_t rawGx = (int16_t)((buf[9] << 8) | buf[8]);
+   int16_t rawGy = (int16_t)((buf[11] << 8) | buf[10]);
+   int16_t rawGz = (int16_t)((buf[13] << 8) | buf[12]);
+   float gx = (float)rawGx / 64.0f;   // Scale: ±512 dps
+   float gy = (float)rawGy / 64.0f;
+   float gz = (float)rawGz / 64.0f;
+
+--------------------------------------------------------------------------------
+5. PHYSICAL MOUNTING & SCREEN AXES ALIGNMENT
+--------------------------------------------------------------------------------
+- On the Waveshare 1.9" board, the QMI8658 chip is mounted on the REAR of the PCB.
+- In Portrait orientation (170 width × 320 height):
+  * Roll (Horizontal tilt left/right across 170px width): Driven by ax.
+  * Pitch (Vertical tilt forward/backward along 320px height): Driven by ay.
+  * Z-Axis: Perpendicular to screen surface.
+    Due to rear-mounting, Z sign must be tracked so that face-up = nominal +1.0G.
+
+- Clean Tilt Angle Formulas (0° to ±90° without 180° rollover):
+  float safeZ = (fabs(az) > 0.05f) ? az : 0.05f;
+  float roll  = atan2(ax, safeZ) * 180.0f / PI;
+  float pitch = atan2(-ay, safeZ) * 180.0f / PI;
+
+--------------------------------------------------------------------------------
+6. CALIBRATION (ZERO-G BIAS REMOVAL)
+--------------------------------------------------------------------------------
+- MEMS accelerometers inherently have small zero-g manufacturing biases 
+  (e.g., reading 0.07G instead of 0.00G when resting flat).
+- Solution: One-Touch Zero Calibration
+  * Place board flat on a table (face up).
+  * Trigger calibration via onboard BOOT button (GPIO 9) or Serial ('c').
+  * Average 50 samples:
+      offsetAx = sumAx / 50;
+      offsetAy = sumAy / 50;
+      offsetAz = (avgAz >= 0) ? (avgAz - 1.0f) : (avgAz + 1.0f);
+  * Subtract offsets from raw values before calculating Roll/Pitch.
+  * Result: Perfect 0.0° / 0.0° resting levels and dead-center bubble level.
+
+--------------------------------------------------------------------------------
+7. JITTER FILTERING
+--------------------------------------------------------------------------------
+- Prevent hand tremor and high-frequency noise from vibrating the UI:
+  Use an exponential low-pass filter:
+  roll  = (roll  * 0.60f) + (targetRoll  * 0.40f);
+  pitch = (pitch * 0.60f) + (targetPitch * 0.40f);
+================================================================================
+

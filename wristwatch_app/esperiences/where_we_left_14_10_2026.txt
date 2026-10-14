@@ -1,0 +1,83 @@
+================================================================================
+SESSION STATUS & WHERE WE LEFT OFF: OCTOBER 14, 2026
+================================================================================
+Date: October 14, 2026
+Target Hardware: Waveshare ESP32-C6FH8 with 1.9" ST7789 LCD (320x170 Landscape) + QMI8658 IMU
+Mobile Companion: Flutter App (`wristwatch_app`) on Android 14+ (Poco X7 Pro / HyperOS)
+
+--------------------------------------------------------------------------------
+1. COMPLETED & ADOPTED FOR FINAL PRODUCT
+--------------------------------------------------------------------------------
+1. Real-Time Volume Sync (< 15ms Instant):
+   - Fully solved & verified. Removed blocking `Serial.printf` inside NimBLE callbacks
+     (eliminated 1000ms USB CDC timeout stall), added `Serial.setTxTimeoutMs(0)`,
+     and made `currentVolume` volatile. Syncs instantly across both app slider and
+     physical rocker. (Documented in `esperiences/volume_sync.txt`).
+
+2. Messenger Notification Hijack Prevention:
+   - Fixed WhatsApp/messaging avatars hijacking cover art by decoupling `event.largeIcon`
+     from player identification and establishing strict whitelist/blacklist filters.
+   - Added cover art length deduplication to avoid redundant BLE retransmissions.
+
+3. 100% Lossless QOI Cover Art Streaming (<100ms Total Latency):
+   - **CONFIRMED & ADOPTED AS FINAL PRODUCTION STANDARD.**
+   - Tested and verified: Visual quality is crystal clear, 100% lossless, with zero
+     JPEG blockiness or banding.
+   - Reduced payload from 28.8 KB (raw RGB565) to ~8-14 KB QOI.
+   - High-speed 480-byte BLE chunks at 3ms pacing = ~70-90 ms wire transmission.
+   - Embedded native C++ decoder on ESP32-C6 RISC-V decodes directly to `artBuffer`
+     in ~2 ms with ZERO dynamic heap allocations.
+   - Replaced and removed external `JPEGDEC` library dependency completely.
+
+4. Pop-up Notifications & Phone Call Alert Modals (BB05 Protocol):
+   - Implemented transient modal overlays on top of persistent media UI.
+   - Messages (WhatsApp / SMS): Floating rounded card (280x124 px at X:20, Y:23) with
+     app badge, sender name, 3-line word-wrapped message body, and a real-time
+     countdown timer bar that shrinks over 6 seconds before auto-dismissing.
+   - Phone Calls: Full-screen takeover alert (320x170 px) with pulsating red banner,
+     prominent caller name, number/status, and visual Decline / Accept action pills.
+   - Screen State Machine: Zero frame buffer memory overhead; automatically restores
+     full media player screen in < 15 ms upon modal dismissal or call end.
+   - Android Routing: Fully handles incoming phone calls, WhatsApp messages, and SMS,
+     with test buttons in the companion app UI for instant display verification.
+   - Documented in `esperiences/pop_up_notifications.txt`.
+
+--------------------------------------------------------------------------------
+2. BLE GATT ARCHITECTURE
+--------------------------------------------------------------------------------
+- BB01: Instant Volume (Bidirectional, 0-100)
+- BB02: Physical / UI Volume & Command Controls (UP, DOWN, MUTE)
+- BB03: Song Title & Artist Metadata (Instant Write Without Response)
+- BB04: 120x120 Album Cover Art Stream (Lossless QOI Chunked Protocol)
+- BB05: Pop-up Notification & Call Stream (`WA|...`, `SMS|...`, `CALL|...`, `CALL_END`)
+
+--------------------------------------------------------------------------------
+3. CANDIDATE NEXT STEPS / FUTURE ROADMAP
+--------------------------------------------------------------------------------
+1. Media Playback Controls over BLE:
+   - Add Play/Pause, Next Track, Previous Track controls from watch buttons / touch / gestures
+     relayed to the Android MediaSession / AudioManager.
+2. Wrist-Tilt & IMU Features:
+   - Integrate the onboard QMI8658 6-axis IMU (e.g., raise-to-wake, shake/twist to skip track).
+   - Reference guide ready in `esperiences/IMU.txt`.
+3. UI Polish & Display Sleep:
+   - Backlight timeout / power management for battery operation (`TFT_BL`).
+   - Scrolling text or marquee for titles longer than screen bounds.
+
+--------------------------------------------------------------------------------
+4. RELEVANT PROJECT FILES
+--------------------------------------------------------------------------------
+- ESP32 Firmware:
+  `e:\WristWatch\wristwatch_app\c6_media_display\c6_media_display.ino`
+- Flutter Companion App:
+  `e:\WristWatch\wristwatch_app\lib\qoi_encoder.dart`
+  `e:\WristWatch\wristwatch_app\lib\main.dart`
+- Verification Suite:
+  `e:\WristWatch\wristwatch_app\test\qoi_test.dart`
+- Knowledge Base:
+  `esperiences/pop_up_notifications.txt` (Complete pop-up & call alert modal architecture)
+  `esperiences/BLE_cover_art.txt` (QOI & BLE transmission specifications)
+  `esperiences/volume_sync.txt` (Volume sync latency resolution post-mortem)
+  `esperiences/screen.txt` (Display driver and coordinate layout)
+  `esperiences/IMU.txt` (QMI8658 sensor reference)
+================================================================================
